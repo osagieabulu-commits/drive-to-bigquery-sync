@@ -3,7 +3,7 @@ name: Daily Google Drive to BigQuery Sync
 on:
   schedule:
     # This is "Cron" format. 0 9 * * * means 9:00 AM UTC every day.
-    - cron: '0 9 * * *'
+    - cron: '0 11 * * *'
   workflow_dispatch: # This adds the "Run workflow" button so you can test it manually
 
 jobs:
