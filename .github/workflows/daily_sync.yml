@@ -2,30 +2,45 @@ name: Daily Google Drive to BigQuery Sync
 
 on:
   schedule:
-    # This is "Cron" format. 0 9 * * * means 9:00 AM UTC every day.
-    - cron: '0 11 * * *'
-  workflow_dispatch: # This adds the "Run workflow" button so you can test it manually
+    - cron: '0 11 * * *' # 12:00 PM WAT
+  workflow_dispatch:
 
 jobs:
   run-sync-task:
-    runs-on: ubuntu-latest # This tells GitHub to use a Linux cloud computer
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4 # Pulls your code from the repo onto the cloud computer
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      # --- RESTORE MEMORY ---
+      - name: Restore Sync State
+        uses: actions/cache@v4
+        with:
+          path: sync_state.json
+          key: sync-state-${{ github.run_id }}
+          restore-keys: |
+            sync-state-
+
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt # Installs everything listed in your requirements.txt
+          pip install -r requirements.txt
 
       - name: Run the script
         env:
-          # This connects your secret JSON to the script
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
         run: python main.py
+
+      # --- SAVE MEMORY ---
+      - name: Save Sync State
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: sync_state.json
+          key: sync-state-${{ github.run_id }}
