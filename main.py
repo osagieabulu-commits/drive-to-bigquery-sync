@@ -15,21 +15,10 @@ SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 MAIN_FOLDER_ID = '1Bmvq-3vm1L1UWiZPwIFc5yVdt6eYC2M6'
 BQ_PROJECT_ID = 'lead-db-drive-bigquery'
 BQ_DATASET_ID = 'Leadership_dashboard'
+STATE_FILE = 'sync_state.json'
+JIRA_TABLE_NAME = 'jira_timepiece'
 
-# The specific table that needs to update existing rows
-JIRA_TABLE_NAME = 'jira_timepiece' 
-
-# Load Credentials from GitHub Secrets
-GCP_JSON = os.environ.get('GCP_SERVICE_ACCOUNT_JSON')
-if not GCP_JSON:
-    raise ValueError("CRITICAL: GCP_SERVICE_ACCOUNT_JSON secret not found!")
-
-SERVICE_ACCOUNT_INFO = json.loads(GCP_JSON)
-CREDS = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
-BQ_CREDS = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
-
-# Standard Tables: Only add NEW rows (No updates to old data)
-# NOTE: Removed 'jira_sla_control' from here so it uses the special logic below.
+# Standard Tables: Only add NEW rows (File-level skipping enabled)
 TABLE_KEY_COLUMNS = {
     'ph_dates': ['date'],
     'k4b_sla_table': ['conversation_id', 'sla_started_at_africa_algiers_'],
@@ -57,81 +46,28 @@ TABLE_KEY_COLUMNS = {
     'fcr_subcat_source': ['conversation_id', 'conversation_started_at_africa_algiers_'],
 }
 
-# ==============================================================================
-# --- UPLOAD LOGIC ---
-# ==============================================================================
-
-def perform_jira_upsert_free_tier(df, table_name, bq_client):
-    """
-    Python-side Upsert: Downloads old data, merges with new, 
-    keeps latest version of 'key', then overwrites table.
-    Works on BigQuery Free Tier (No DML/Merge required).
-    """
-    table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
-    
-    # 1. Ensure required columns for logic exist
-    if 'key' not in df.columns or 'updated' not in df.columns:
-        print(f"⚠️ Jira data missing 'key' or 'updated' columns. Defaulting to standard upload.")
-        return upload_standard(df, table_name, bq_client)
-
-    try:
-        # 2. Pull existing data from BigQuery
-        print(f"📥 Downloading existing {table_name} for Python-side upsert...")
-        existing_df = bq_client.query(f"SELECT * FROM `{table_id}`").to_dataframe()
-        
-        # 3. Combine and Deduplicate
-        # We put new data at the bottom so it's 'newer' in the sort
-        combined_df = pd.concat([existing_df, df], ignore_index=True)
-        
-        # Convert 'updated' to datetime to ensure correct sorting
-        combined_df['updated'] = pd.to_datetime(combined_df['updated'], errors='coerce')
-        combined_df = combined_df.sort_values('updated', ascending=True)
-        
-        # Keep the LAST occurrence of every Key (the most recent update)
-        final_df = combined_df.drop_duplicates(subset=['key'], keep='last')
-        
-        # Clean up types before uploading
-        final_df = final_df.astype(str).replace(['nan', 'NaN', 'None', 'NaT', 'nat', ''], None)
-        print(f"🔄 De-duplicated Jira data: {len(existing_df)} old -> {len(final_df)} merged.")
-        
-    except Exception as e:
-        print(f"ℹ️ Could not pull old table (likely doesn't exist yet): {e}")
-        final_df = df
-
-    # 4. Overwrite (WRITE_TRUNCATE is allowed in Free Tier)
-    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
-    bq_client.load_table_from_dataframe(final_df, table_id, job_config=job_config).result()
-    return len(final_df)
-
-def upload_standard(df, table_name, bq_client):
-    """Standard Append/Truncate logic for non-Jira tables."""
-    table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
-    keys = TABLE_KEY_COLUMNS.get(table_name)
-    write_disposition = "WRITE_APPEND"
-
-    try:
-        bq_client.get_table(table_id)
-        if keys and all(k in df.columns for k in keys):
-            key_select = ", ".join([f"CAST(`{k}` AS STRING)" for k in keys])
-            query = f"SELECT DISTINCT CONCAT({key_select}) as row_id FROM `{table_id}`"
-            existing_ids = set(bq_client.query(query).to_dataframe()['row_id'])
-            
-            df['_tmp_id'] = ""
-            for k in keys: df['_tmp_id'] += df[k].fillna('NULL').astype(str)
-            df = df[~df['_tmp_id'].isin(existing_ids)].drop(columns=['_tmp_id'])
-            
-            if df.empty: return 0
-        else:
-            write_disposition = "WRITE_TRUNCATE"
-    except Exception:
-        write_disposition = "WRITE_TRUNCATE"
-
-    job_config = bigquery.LoadJobConfig(write_disposition=write_disposition, autodetect=True)
-    bq_client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
-    return len(df)
+# Load Credentials
+GCP_JSON = os.environ.get('GCP_SERVICE_ACCOUNT_JSON')
+SERVICE_ACCOUNT_INFO = json.loads(GCP_JSON)
+CREDS = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
+BQ_CREDS = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
 
 # ==============================================================================
-# --- CORE ENGINE ---
+# --- STATE MANAGEMENT ---
+# ==============================================================================
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_state(state):
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f)
+
+# ==============================================================================
+# --- CORE LOGIC ---
 # ==============================================================================
 
 def download_file_to_dataframe(service, file_info):
@@ -139,9 +75,8 @@ def download_file_to_dataframe(service, file_info):
     try:
         if mime_type == 'application/vnd.google-apps.spreadsheet':
             request = service.files().export_media(fileId=file_id, mimeType='text/csv')
-        elif mime_type in ['text/csv', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']:
+        else:
             request = service.files().get_media(fileId=file_id)
-        else: return None
 
         fh = io.BytesIO()
         downloader = MediaIoBaseDownload(fh, request, chunksize=1024*1024)
@@ -162,10 +97,50 @@ def download_file_to_dataframe(service, file_info):
         print(f"❌ Error downloading {file_name}: {e}")
         return None
 
+def perform_jira_upsert_free_tier(df, table_name, bq_client):
+    table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
+    try:
+        existing_df = bq_client.query(f"SELECT * FROM `{table_id}`").to_dataframe()
+        combined_df = pd.concat([existing_df, df], ignore_index=True)
+        combined_df['updated'] = pd.to_datetime(combined_df['updated'], errors='coerce')
+        combined_df = combined_df.sort_values('updated', ascending=True)
+        final_df = combined_df.drop_duplicates(subset=['key'], keep='last')
+        final_df = final_df.astype(str).replace(['nan', 'NaN', 'None', 'NaT', 'nat', ''], None)
+    except:
+        final_df = df
+
+    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
+    bq_client.load_table_from_dataframe(final_df, table_id, job_config=job_config).result()
+    return len(final_df)
+
+def upload_standard(df, table_name, bq_client):
+    table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
+    keys = TABLE_KEY_COLUMNS.get(table_name)
+    try:
+        bq_client.get_table(table_id)
+        if keys:
+            key_select = ", ".join([f"CAST(`{k}` AS STRING)" for k in keys])
+            query = f"SELECT DISTINCT CONCAT({key_select}) as row_id FROM `{table_id}`"
+            existing_ids = set(bq_client.query(query).to_dataframe()['row_id'])
+            df['_tmp_id'] = ""
+            for k in keys: df['_tmp_id'] += df[k].fillna('NULL').astype(str)
+            df = df[~df['_tmp_id'].isin(existing_ids)].drop(columns=['_tmp_id'])
+            if df.empty: return 0
+            write_disposition = "WRITE_APPEND"
+        else:
+            write_disposition = "WRITE_TRUNCATE"
+    except:
+        write_disposition = "WRITE_TRUNCATE"
+
+    job_config = bigquery.LoadJobConfig(write_disposition=write_disposition, autodetect=True)
+    bq_client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
+    return len(df)
+
 def main():
-    print("🚀 Starting Free-Tier Hybrid Sync...")
+    print("🚀 Starting Memory-Optimized Sync...")
     drive_service = build('drive', 'v3', credentials=CREDS)
     bq_client = bigquery.Client(credentials=BQ_CREDS, project=BQ_PROJECT_ID)
+    state = load_state()
     
     subfolders = drive_service.files().list(
         q=f"'{MAIN_FOLDER_ID}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
@@ -176,25 +151,37 @@ def main():
         table_name = re.sub(r'[\s\W]+', '_', folder['name'].strip().lower())
         files = drive_service.files().list(
             q=f"'{folder['id']}' in parents and trashed = false",
-            fields="files(id, name, mimeType)"
+            fields="files(id, name, mimeType, modifiedTime)"
         ).execute().get('files', [])
         
-        dfs = [download_file_to_dataframe(drive_service, f) for f in files]
-        dfs = [d for d in dfs if d is not None]
+        dfs_to_process = []
+        for f in files:
+            file_id = f['id']
+            # JIRA logic ALWAYS processes files (to ensure updates are caught)
+            # Standard logic checks if file has changed
+            if table_name != JIRA_TABLE_NAME:
+                if state.get(file_id) == f['modifiedTime']:
+                    continue # SKIP DOWNLOADING
+            
+            print(f"📄 Downloading: {f['name']}")
+            df = download_file_to_dataframe(drive_service, f)
+            if df is not None:
+                dfs_to_process.append(df)
+                state[file_id] = f['modifiedTime'] # Record that we processed this version
 
-        if dfs:
-            combined_df = pd.concat(dfs, ignore_index=True)
-            try:
-                if table_name == JIRA_TABLE_NAME:
-                    rows = perform_jira_upsert_free_tier(combined_df, table_name, bq_client)
-                    print(f"✅ Jira Upsert (Python-side) Complete: {rows} total rows in BQ.")
-                else:
-                    rows = upload_standard(combined_df, table_name, bq_client)
-                    print(f"✅ Table '{table_name}': Processed {rows} rows.")
-            except Exception as e:
-                print(f"❌ Critical Error on {table_name}: {e}")
+        if dfs_to_process:
+            combined_df = pd.concat(dfs_to_process, ignore_index=True)
+            if table_name == JIRA_TABLE_NAME:
+                rows = perform_jira_upsert_free_tier(combined_df, table_name, bq_client)
+                print(f"✅ Jira Upsert: {rows} rows in BQ.")
+            else:
+                rows = upload_standard(combined_df, table_name, bq_client)
+                print(f"✅ {table_name}: Added {rows} rows.")
+        else:
+            print(f"⏭️ No new/modified files for {table_name}.")
 
-    print("🎉 Sync completed successfully!")
+    save_state(state)
+    print("🎉 Sync completed!")
 
 if __name__ == '__main__':
     main()
