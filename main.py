@@ -16,16 +16,20 @@ MAIN_FOLDER_ID = '1Bmvq-3vm1L1UWiZPwIFc5yVdt6eYC2M6'
 BQ_PROJECT_ID = 'lead-db-drive-bigquery'
 BQ_DATASET_ID = 'Leadership_dashboard'
 
-# Identify your Jira table for special Upsert logic
+# The specific table that needs to update existing rows
 JIRA_TABLE_NAME = 'jira_timepiece' 
 
-# Load Credentials
+# Load Credentials from GitHub Secrets
 GCP_JSON = os.environ.get('GCP_SERVICE_ACCOUNT_JSON')
+if not GCP_JSON:
+    raise ValueError("CRITICAL: GCP_SERVICE_ACCOUNT_JSON secret not found!")
+
 SERVICE_ACCOUNT_INFO = json.loads(GCP_JSON)
 CREDS = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
 BQ_CREDS = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
 
-# Incremental keys for standard tables
+# Standard Tables: Only add NEW rows (No updates to old data)
+# NOTE: Removed 'jira_sla_control' from here so it uses the special logic below.
 TABLE_KEY_COLUMNS = {
     'ph_dates': ['date'],
     'k4b_sla_table': ['conversation_id', 'sla_started_at_africa_algiers_'],
@@ -54,44 +58,53 @@ TABLE_KEY_COLUMNS = {
 }
 
 # ==============================================================================
-# --- UPSERT / MERGE LOGIC ---
+# --- UPLOAD LOGIC ---
 # ==============================================================================
 
-def perform_jira_upsert(df, table_name, bq_client):
-    """Specific logic for Jira: Updates row if key exists + date is newer."""
-    staging_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}_staging"
-    final_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
-
-    # Ensure key and updated columns exist (lowercase per cleaning logic)
+def perform_jira_upsert_free_tier(df, table_name, bq_client):
+    """
+    Python-side Upsert: Downloads old data, merges with new, 
+    keeps latest version of 'key', then overwrites table.
+    Works on BigQuery Free Tier (No DML/Merge required).
+    """
+    table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
+    
+    # 1. Ensure required columns for logic exist
     if 'key' not in df.columns or 'updated' not in df.columns:
-        print(f"⚠️ Jira table missing 'key' or 'updated' columns. Falling back to Append.")
+        print(f"⚠️ Jira data missing 'key' or 'updated' columns. Defaulting to standard upload.")
         return upload_standard(df, table_name, bq_client)
 
-    # 1. Load to Staging
-    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
-    bq_client.load_table_from_dataframe(df, staging_id, job_config=job_config).result()
+    try:
+        # 2. Pull existing data from BigQuery
+        print(f"📥 Downloading existing {table_name} for Python-side upsert...")
+        existing_df = bq_client.query(f"SELECT * FROM `{table_id}`").to_dataframe()
+        
+        # 3. Combine and Deduplicate
+        # We put new data at the bottom so it's 'newer' in the sort
+        combined_df = pd.concat([existing_df, df], ignore_index=True)
+        
+        # Convert 'updated' to datetime to ensure correct sorting
+        combined_df['updated'] = pd.to_datetime(combined_df['updated'], errors='coerce')
+        combined_df = combined_df.sort_values('updated', ascending=True)
+        
+        # Keep the LAST occurrence of every Key (the most recent update)
+        final_df = combined_df.drop_duplicates(subset=['key'], keep='last')
+        
+        # Clean up types before uploading
+        final_df = final_df.astype(str).replace(['nan', 'NaN', 'None', 'NaT', 'nat', ''], None)
+        print(f"🔄 De-duplicated Jira data: {len(existing_df)} old -> {len(final_df)} merged.")
+        
+    except Exception as e:
+        print(f"ℹ️ Could not pull old table (likely doesn't exist yet): {e}")
+        final_df = df
 
-    # 2. Build Merge Query
-    # Logic: If Key matches but Updated date is different, Update. Else, Insert.
-    cols = [f"`{c}`" for c in df.columns]
-    update_set = ", ".join([f"T.`{c}` = S.`{c}`" for c in df.columns if c != 'key'])
-    
-    merge_sql = f"""
-    MERGE `{final_id}` T
-    USING `{staging_id}` S
-    ON T.`key` = S.`key`
-    WHEN MATCHED AND T.`updated` != S.`updated` THEN
-      UPDATE SET {update_set}
-    WHEN NOT MATCHED THEN
-      INSERT ({", ".join(cols)}) VALUES ({", ".join([f"S.{c}" for c in cols])})
-    """
-    
-    bq_client.query(merge_sql).result()
-    bq_client.delete_table(staging_id, not_found_ok=True)
-    return len(df)
+    # 4. Overwrite (WRITE_TRUNCATE is allowed in Free Tier)
+    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
+    bq_client.load_table_from_dataframe(final_df, table_id, job_config=job_config).result()
+    return len(final_df)
 
 def upload_standard(df, table_name, bq_client):
-    """Standard Incremental or Full Upload logic."""
+    """Standard Append/Truncate logic for non-Jira tables."""
     table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
     keys = TABLE_KEY_COLUMNS.get(table_name)
     write_disposition = "WRITE_APPEND"
@@ -118,7 +131,7 @@ def upload_standard(df, table_name, bq_client):
     return len(df)
 
 # ==============================================================================
-# --- DRIVE FUNCTIONS & MAIN ---
+# --- CORE ENGINE ---
 # ==============================================================================
 
 def download_file_to_dataframe(service, file_info):
@@ -146,11 +159,11 @@ def download_file_to_dataframe(service, file_info):
         df = df.astype(str).replace(['nan', 'NaN', 'None', '', 'NULL', '<NA>', 'nat', 'NaT'], None)
         return df
     except Exception as e:
-        print(f"❌ Error processing {file_name}: {e}")
+        print(f"❌ Error downloading {file_name}: {e}")
         return None
 
 def main():
-    print("🚀 Starting Hybrid Sync with Jira Upsert...")
+    print("🚀 Starting Free-Tier Hybrid Sync...")
     drive_service = build('drive', 'v3', credentials=CREDS)
     bq_client = bigquery.Client(credentials=BQ_CREDS, project=BQ_PROJECT_ID)
     
@@ -173,15 +186,15 @@ def main():
             combined_df = pd.concat(dfs, ignore_index=True)
             try:
                 if table_name == JIRA_TABLE_NAME:
-                    rows = perform_jira_upsert(combined_df, table_name, bq_client)
-                    print(f"✅ Jira Upsert: {rows} rows processed.")
+                    rows = perform_jira_upsert_free_tier(combined_df, table_name, bq_client)
+                    print(f"✅ Jira Upsert (Python-side) Complete: {rows} total rows in BQ.")
                 else:
                     rows = upload_standard(combined_df, table_name, bq_client)
-                    print(f"✅ {table_name}: {rows} rows processed.")
+                    print(f"✅ Table '{table_name}': Processed {rows} rows.")
             except Exception as e:
-                print(f"❌ Error on {table_name}: {e}")
+                print(f"❌ Critical Error on {table_name}: {e}")
 
-    print("🎉 All tasks finished!")
+    print("🎉 Sync completed successfully!")
 
 if __name__ == '__main__':
     main()
