@@ -23,7 +23,7 @@ TABLE_KEY_COLUMNS = {
     'ph_dates': ['date'],
     'k4b_sla_table': ['conversation_id', 'sla_started_at_africa_algiers_'],
     'retail_sla_table': ['conversation_id', 'sla_started_at_africa_algiers_'],
-    'avr_cbn_remediation': ['account_number', 'physical_address_verification_time'],
+    'account_closure': ['account_number', 'date_of_request'],
     'cx_scroe_rating_topics': ['conversation_id', 'conversation_last_closed_at_africa_algiers_'],
     'retail_reopened_conv_source': ['conversation_id', 'action_time_africa_algiers_'],
     'k4b_reopened_conv_source': ['conversation_id', 'action_time_africa_algiers_'],
