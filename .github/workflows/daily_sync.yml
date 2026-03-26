@@ -2,7 +2,7 @@ name: Daily Google Drive to BigQuery Sync
 
 on:
   schedule:
-    - cron: '0 11 * * *' # 12:00 PM WAT
+    - cron: '0 9 * * *' # 10:00 AM WAT
   workflow_dispatch:
 
 jobs:
