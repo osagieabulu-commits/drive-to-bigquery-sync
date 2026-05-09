@@ -165,6 +165,17 @@ def main():
 
     for folder in subfolders:
         table_name = re.sub(r'[\s\W]+', '_', folder['name'].strip().lower())
+        table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}" # Define table_id here
+        
+        # --- NEW: SELF-HEALING CHECK ---
+        table_exists = True
+        try:
+            bq_client.get_table(table_id)
+        except Exception:
+            table_exists = False
+            print(f"\n📢 Table '{table_name}' is missing in BQ! Forcing full refresh.")
+        # -------------------------------
+
         files = drive_service.files().list(
             q=f"'{folder['id']}' in parents and trashed = false", 
             fields="files(id, name, mimeType, modifiedTime)"
@@ -173,9 +184,12 @@ def main():
         dfs_to_process = []
         for f in files:
             file_id = f['id']
-            # Upsert tables ALWAYS download. Standard tables check the sync_state cache.
+            
+            # Upsert tables ALWAYS download. 
+            # Standard tables check cache, BUT ignore cache if the table was deleted in BQ
             if table_name not in UPSERT_TABLES:
-                if state.get(file_id) == f['modifiedTime']: continue
+                if table_exists and state.get(file_id) == f['modifiedTime']: 
+                    continue
             
             print(f"📄 Downloading: {f['name']}")
             df = download_file_to_dataframe(drive_service, f)
@@ -200,6 +214,6 @@ def main():
 
     save_state(state)
     print("🎉 Sync completed!")
-
+    
 if __name__ == '__main__':
     main()
