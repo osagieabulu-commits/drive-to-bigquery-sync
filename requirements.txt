@@ -5,3 +5,5 @@ google-cloud-bigquery
 openpyxl
 pyarrow
 db-dtypes
+pandas-gbq
+xlrd
