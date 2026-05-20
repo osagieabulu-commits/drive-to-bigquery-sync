@@ -72,6 +72,19 @@ def save_state(state):
 
 def download_file_to_dataframe(service, file_info):
     file_id, file_name, mime_type = file_info['id'], file_info['name'], file_info['mimeType']
+    
+    # --- GATEKEEPER: Only allow valid data files (.csv, .xlsx, .xls, Google Sheets) ---
+    is_valid_file = (
+        'csv' in mime_type or 
+        'spreadsheet' in mime_type or 
+        'excel' in mime_type or 
+        'openxmlformats' in mime_type or 
+        file_name.lower().endswith('.xlsx') or 
+        file_name.lower().endswith('.xls')
+    )
+    if not is_valid_file:
+        return None
+
     try:
         request = service.files().export_media(fileId=file_id, mimeType='text/csv') if mime_type == 'application/vnd.google-apps.spreadsheet' else service.files().get_media(fileId=file_id)
         fh = io.BytesIO()
@@ -80,9 +93,16 @@ def download_file_to_dataframe(service, file_info):
         while not done: _, done = downloader.next_chunk()
         fh.seek(0)
         
-        if mime_type in ['text/csv', 'application/vnd.google-apps.spreadsheet']:
-            df = pd.read_csv(fh, low_memory=False, dtype=str, keep_default_na=False)
+        # Parse based on file type
+        if 'csv' in mime_type or mime_type == 'application/vnd.google-apps.spreadsheet' or file_name.lower().endswith('.csv'):
+            try:
+                df = pd.read_csv(fh, low_memory=False, dtype=str, keep_default_na=False, encoding='utf-8')
+            except UnicodeDecodeError:
+                # Fallback if the CSV has weird text encoding
+                fh.seek(0)
+                df = pd.read_csv(fh, low_memory=False, dtype=str, keep_default_na=False, encoding='latin1')
         else: 
+            # Pandas will auto-detect between openpyxl (.xlsx) and xlrd (.xls)
             df = pd.read_excel(fh, dtype=str)
             
         if df.empty: return None
@@ -165,7 +185,7 @@ def main():
 
     for folder in subfolders:
         table_name = re.sub(r'[\s\W]+', '_', folder['name'].strip().lower())
-        table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}" # Define table_id here
+        table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
         
         # --- NEW: SELF-HEALING CHECK ---
         table_exists = True
@@ -191,9 +211,9 @@ def main():
                 if table_exists and state.get(file_id) == f['modifiedTime']: 
                     continue
             
-            print(f"📄 Downloading: {f['name']}")
             df = download_file_to_dataframe(drive_service, f)
             if df is not None:
+                print(f"📄 Downloaded: {f['name']}")
                 dfs_to_process.append(df)
                 state[file_id] = f['modifiedTime']
 
