@@ -23,8 +23,15 @@ STATE_FILE = 'sync_state.json'
 UPSERT_TABLES = {
     'jira_timepiece': {'id_col': 'key', 'date_col': 'updated'},
     'avr__house_street_view_': {'id_col': 'account_number', 'date_col': 'approval_date'},
-    'avr__poa_': {'id_col': 'account_number', 'date_col': 'approval_date'}
+    'avr__poa_': {'id_col': 'account_number', 'date_col': 'approval_date'},
+    'avr__auto_review_': {'id_col': 'account_number', 'date_col': 'date'},
 }
+
+# Safety circuit breaker for upsert reconciliation: if more rows than this
+# fraction look "removed from source" in a single run, treat it as a likely
+# partial/failed download rather than real removals, and skip cleanup for
+# that run rather than risk mass-deleting still-valid rows.
+UPSERT_SAFETY_MAX_REMOVAL_RATIO = 0.5
 
 # Standard Tables: Only add NEW rows (Incremental via Key check)
 TABLE_KEY_COLUMNS = {
@@ -48,7 +55,6 @@ TABLE_KEY_COLUMNS = {
     'k4b_upgrages': ['id', 'creation_date'],
     'k4b_upgrade__freelance_': ['customerid', 'created_at'],
     'avr__manual_': ['account_number', 'creation_date'],
-    'avr__auto_review_': ['account_number', 'date'],
     'fcr_subcat_source': ['conversation_id', 'conversation_started_at_africa_algiers_'],
 }
 
@@ -112,22 +118,74 @@ def download_file_to_dataframe(service, file_info):
         print(f"❌ Error downloading {file_name}: {e}")
         return None
 
+def _normalize_id_column(series):
+    """Coerce an ID column to clean, comparable strings regardless of whether
+    it arrived as a BigQuery-typed numeric column (existing_df) or a raw
+    string from Drive (df). Without this, the same id — e.g. an
+    account_number that BQ autodetected as INTEGER/FLOAT — gets compared as
+    1000123456 vs '1000123456' and drop_duplicates treats them as two
+    different rows, so the old (often still-"pending") copy never gets
+    collapsed or overwritten by the newer one.
+    """
+    def clean(v):
+        if pd.isna(v):
+            return None
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        cleaned = str(v).strip()
+        return cleaned if cleaned else None
+    return series.apply(clean)
+
 def perform_upsert_free_tier(df, table_name, bq_client, id_col, date_col):
     """Universal Upsert logic for Free Tier with Index Fix."""
     table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
+
+    df[id_col] = _normalize_id_column(df[id_col])
+
+    # Upsert tables always re-download every file in their folder each run
+    # (see main()), so df is the FULL current state of the source for this
+    # table right now. That means any id_col present in BQ but missing from
+    # df has been resolved/archived/removed upstream — it should NOT keep
+    # being carried forward as "still pending" forever.
+    current_ids = set(df[id_col].dropna())
+
     try:
         print(f"📥 Pulling existing data for {table_name} upsert...")
         # Download existing data
         existing_df = bq_client.query(f"SELECT * FROM `{table_id}`").to_dataframe()
-        
+        existing_df[id_col] = _normalize_id_column(existing_df[id_col])
+
+        removed_mask = ~existing_df[id_col].isin(current_ids)
+        removed_count = int(removed_mask.sum())
+        removal_ratio = removed_count / len(existing_df) if len(existing_df) else 0
+
+        if removal_ratio > UPSERT_SAFETY_MAX_REMOVAL_RATIO:
+            # More likely a partial/failed download than a genuine wave of
+            # resolutions — skip cleanup this run rather than risk deleting
+            # rows that are still valid in the source.
+            print(f"⚠️ {removed_count}/{len(existing_df)} rows for {table_name} look removed from "
+                  f"source (>{UPSERT_SAFETY_MAX_REMOVAL_RATIO:.0%}) — skipping stale-row cleanup this run as a precaution.")
+        elif removed_count:
+            print(f"🗑️ {removed_count} rows no longer present in source for {table_name} — removing stale records.")
+            existing_df = existing_df[~removed_mask]
+
         # Combine data and ignore index to prevent __index_level_0__ duplication
         combined_df = pd.concat([existing_df, df], ignore_index=True)
         
-        # Ensure date column is datetime for correct sorting
+        # Ensure date column is datetime for correct sorting. na_position='first'
+        # sends blank/unparseable dates to the FRONT of the sort, so a row with
+        # no date can never be mistaken for "the latest" — previously, blank
+        # dates sorted LAST by default, so a still-pending row with no date
+        # could outrank a genuinely newer, dated row under keep='last'.
         combined_df[date_col] = pd.to_datetime(combined_df[date_col], errors='coerce')
         
-        # Sort by date and keep the latest record for each ID
-        final_df = combined_df.sort_values(date_col, ascending=True).drop_duplicates(subset=[id_col], keep='last')
+        # Sort by date and keep the latest record for each ID.
+        # kind='mergesort' is a stable sort: when dates tie exactly (including
+        # ties among several blank ones), the row from THIS run's fresh pull —
+        # concatenated after existing_df — reliably wins.
+        final_df = combined_df.sort_values(
+            date_col, ascending=True, na_position='first', kind='mergesort'
+        ).drop_duplicates(subset=[id_col], keep='last')
         
         # CRITICAL: Reset index and drop it so it doesn't get sent to BigQuery as a column
         final_df = final_df.reset_index(drop=True)
