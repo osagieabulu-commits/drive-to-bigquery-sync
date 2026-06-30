@@ -18,8 +18,6 @@ BQ_DATASET_ID = 'Leadership_dashboard'
 STATE_FILE = 'sync_state.json'
 
 # --- UPSERT CONFIGURATION ---
-# These tables will look at existing data in BQ, merge with Drive, 
-# and keep only the latest record based on the date column.
 UPSERT_TABLES = {
     'jira_timepiece': {'id_col': 'key', 'date_col': 'updated'},
     'avr__house_street_view_': {'id_col': 'account_number', 'date_col': 'approval_date'},
@@ -27,10 +25,6 @@ UPSERT_TABLES = {
     'avr__auto_review_': {'id_col': 'account_number', 'date_col': 'date'},
 }
 
-# Safety circuit breaker for upsert reconciliation: if more rows than this
-# fraction look "removed from source" in a single run, treat it as a likely
-# partial/failed download rather than real removals, and skip cleanup for
-# that run rather than risk mass-deleting still-valid rows.
 UPSERT_SAFETY_MAX_REMOVAL_RATIO = 0.5
 
 # Standard Tables: Only add NEW rows (Incremental via Key check)
@@ -104,11 +98,9 @@ def download_file_to_dataframe(service, file_info):
             try:
                 df = pd.read_csv(fh, low_memory=False, dtype=str, keep_default_na=False, encoding='utf-8')
             except UnicodeDecodeError:
-                # Fallback if the CSV has weird text encoding
                 fh.seek(0)
                 df = pd.read_csv(fh, low_memory=False, dtype=str, keep_default_na=False, encoding='latin1')
         else: 
-            # Pandas will auto-detect between openpyxl (.xlsx) and xlrd (.xls)
             df = pd.read_excel(fh, dtype=str)
             
         if df.empty: return None
@@ -119,14 +111,6 @@ def download_file_to_dataframe(service, file_info):
         return None
 
 def _normalize_id_column(series):
-    """Coerce an ID column to clean, comparable strings regardless of whether
-    it arrived as a BigQuery-typed numeric column (existing_df) or a raw
-    string from Drive (df). Without this, the same id — e.g. an
-    account_number that BQ autodetected as INTEGER/FLOAT — gets compared as
-    1000123456 vs '1000123456' and drop_duplicates treats them as two
-    different rows, so the old (often still-"pending") copy never gets
-    collapsed or overwritten by the newer one.
-    """
     def clean(v):
         if pd.isna(v):
             return None
@@ -137,21 +121,13 @@ def _normalize_id_column(series):
     return series.apply(clean)
 
 def perform_upsert_free_tier(df, table_name, bq_client, id_col, date_col):
-    """Universal Upsert logic for Free Tier with Index Fix."""
+    """Universal Upsert logic for Free Tier with Index Fix and Safety Breaker."""
     table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
-
     df[id_col] = _normalize_id_column(df[id_col])
-
-    # Upsert tables always re-download every file in their folder each run
-    # (see main()), so df is the FULL current state of the source for this
-    # table right now. That means any id_col present in BQ but missing from
-    # df has been resolved/archived/removed upstream — it should NOT keep
-    # being carried forward as "still pending" forever.
     current_ids = set(df[id_col].dropna())
 
     try:
         print(f"📥 Pulling existing data for {table_name} upsert...")
-        # Download existing data
         existing_df = bq_client.query(f"SELECT * FROM `{table_id}`").to_dataframe()
         existing_df[id_col] = _normalize_id_column(existing_df[id_col])
 
@@ -160,44 +136,24 @@ def perform_upsert_free_tier(df, table_name, bq_client, id_col, date_col):
         removal_ratio = removed_count / len(existing_df) if len(existing_df) else 0
 
         if removal_ratio > UPSERT_SAFETY_MAX_REMOVAL_RATIO:
-            # More likely a partial/failed download than a genuine wave of
-            # resolutions — skip cleanup this run rather than risk deleting
-            # rows that are still valid in the source.
             print(f"⚠️ {removed_count}/{len(existing_df)} rows for {table_name} look removed from "
                   f"source (>{UPSERT_SAFETY_MAX_REMOVAL_RATIO:.0%}) — skipping stale-row cleanup this run as a precaution.")
         elif removed_count:
             print(f"🗑️ {removed_count} rows no longer present in source for {table_name} — removing stale records.")
             existing_df = existing_df[~removed_mask]
 
-        # Combine data and ignore index to prevent __index_level_0__ duplication
         combined_df = pd.concat([existing_df, df], ignore_index=True)
-        
-        # Ensure date column is datetime for correct sorting. na_position='first'
-        # sends blank/unparseable dates to the FRONT of the sort, so a row with
-        # no date can never be mistaken for "the latest" — previously, blank
-        # dates sorted LAST by default, so a still-pending row with no date
-        # could outrank a genuinely newer, dated row under keep='last'.
         combined_df[date_col] = pd.to_datetime(combined_df[date_col], errors='coerce')
-        
-        # Sort by date and keep the latest record for each ID.
-        # kind='mergesort' is a stable sort: when dates tie exactly (including
-        # ties among several blank ones), the row from THIS run's fresh pull —
-        # concatenated after existing_df — reliably wins.
         final_df = combined_df.sort_values(
             date_col, ascending=True, na_position='first', kind='mergesort'
         ).drop_duplicates(subset=[id_col], keep='last')
-        
-        # CRITICAL: Reset index and drop it so it doesn't get sent to BigQuery as a column
         final_df = final_df.reset_index(drop=True)
-        
-        # Clean up types for BigQuery
         final_df = final_df.astype(str).replace(['nan', 'NaN', 'None', 'NaT', 'nat', ''], None)
         
     except Exception as e:
         print(f"ℹ️ Starting fresh or error on {table_name}: {e}")
         final_df = df.reset_index(drop=True)
 
-    # Use WRITE_TRUNCATE to replace the table with the merged/deduplicated version
     job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
     bq_client.load_table_from_dataframe(final_df, table_id, job_config=job_config).result()
     return len(final_df)
@@ -224,47 +180,74 @@ def upload_standard(df, table_name, bq_client):
     except: 
         write_disposition = "WRITE_TRUNCATE"
 
-    # Reset index here as well for safety
     df = df.reset_index(drop=True)
     job_config = bigquery.LoadJobConfig(write_disposition=write_disposition, autodetect=True)
     bq_client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
     return len(df)
 
 def main():
-    print("🚀 Starting Hybrid Memory-Optimized Sync...")
+    print("🚀 Starting Hybrid Memory-Optimized Sync with Shortcut Support...")
     drive_service = build('drive', 'v3', credentials=CREDS)
     bq_client = bigquery.Client(credentials=BQ_CREDS, project=BQ_PROJECT_ID)
     state = load_state()
     
-    subfolders = drive_service.files().list(
-        q=f"'{MAIN_FOLDER_ID}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false", 
-        fields="files(id, name)"
+    # 1. RESOLVE FOLDERS & FOLDER SHORTCUTS
+    # Query now includes both native folders and shortcuts
+    folder_query = f"'{MAIN_FOLDER_ID}' in parents and (mimeType = 'application/vnd.google-apps.folder' or mimeType = 'application/vnd.google-apps.shortcut') and trashed = false"
+    subfolders_raw = drive_service.files().list(
+        q=folder_query, 
+        fields="files(id, name, mimeType, shortcutDetails)"
     ).execute().get('files', [])
 
-    for folder in subfolders:
+    resolved_folders = []
+    for item in subfolders_raw:
+        if item['mimeType'] == 'application/vnd.google-apps.shortcut':
+            details = item.get('shortcutDetails', {})
+            # If the shortcut points to a folder, resolve it to the target ID
+            if details.get('targetMimeType') == 'application/vnd.google-apps.folder':
+                resolved_folders.append({'name': item['name'], 'id': details.get('targetId')})
+        else:
+            resolved_folders.append({'name': item['name'], 'id': item['id']})
+
+    for folder in resolved_folders:
         table_name = re.sub(r'[\s\W]+', '_', folder['name'].strip().lower())
         table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}"
         
-        # --- NEW: SELF-HEALING CHECK ---
         table_exists = True
         try:
             bq_client.get_table(table_id)
         except Exception:
             table_exists = False
             print(f"\n📢 Table '{table_name}' is missing in BQ! Forcing full refresh.")
-        # -------------------------------
 
-        files = drive_service.files().list(
+        # 2. RESOLVE FILES & FILE SHORTCUTS
+        files_raw = drive_service.files().list(
             q=f"'{folder['id']}' in parents and trashed = false", 
-            fields="files(id, name, mimeType, modifiedTime)"
+            fields="files(id, name, mimeType, modifiedTime, shortcutDetails)"
         ).execute().get('files', [])
         
+        resolved_files = []
+        for f in files_raw:
+            if f['mimeType'] == 'application/vnd.google-apps.shortcut':
+                target_id = f.get('shortcutDetails', {}).get('targetId')
+                if not target_id: continue
+                try:
+                    # Reach through the shortcut to get the actual target file's metadata
+                    # This ensures modifiedTime reflects the real file, keeping the cache accurate.
+                    real_file = drive_service.files().get(
+                        fileId=target_id, 
+                        fields="id, name, mimeType, modifiedTime"
+                    ).execute()
+                    resolved_files.append(real_file)
+                except Exception as e:
+                    print(f"⚠️ Could not resolve shortcut for {f['name']}: {e}")
+            else:
+                resolved_files.append(f)
+
         dfs_to_process = []
-        for f in files:
+        for f in resolved_files:
             file_id = f['id']
             
-            # Upsert tables ALWAYS download. 
-            # Standard tables check cache, BUT ignore cache if the table was deleted in BQ
             if table_name not in UPSERT_TABLES:
                 if table_exists and state.get(file_id) == f['modifiedTime']: 
                     continue
